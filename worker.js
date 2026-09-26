@@ -1,10 +1,13 @@
-// 主上游锁定官方主站，配置备用容灾源
+// 主上游锁定官方主站，配置备用源
 const PRIMARY_UPSTREAM = "api.asmr.one";
 const BACKUP_UPSTREAMS = ["api.asmr-200.com", "api.asmr-100.com"];
 
+// 单节点超时阈值（毫秒）：超过此时间直接换下一个节点，防止客户端转圈卡死
+const TIMEOUT_LIMIT = 4000;
+
 export default {
   async fetch(request, env, ctx) {
-    // 1. 跨域预检快速响应（缓存 24 小时减少握手）
+    // 1. 处理 CORS 跨域预检
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -21,24 +24,23 @@ export default {
     const isGet = request.method === "GET";
     const isHead = request.method === "HEAD";
 
-    // 2. 边缘缓存策略判断（元数据、标签、封面文件走边缘加速）
-    const isCacheableStatic = isGet && (
+    // 2. 智能判断可边缘缓存的数据（作品详情、音轨列表、封面图、标签）
+    // 动态接口（登录 me、收藏、评论等）严禁缓存
+    const isCacheable = (isGet || isHead) && (
+      url.pathname.includes("/api/work/") ||
+      url.pathname.includes("/api/tracks/") ||
+      url.pathname.includes("/api/tags") ||
       url.pathname.includes("/covers/") ||
-      url.pathname.includes("/images/") ||
       url.pathname.endsWith(".jpg") ||
       url.pathname.endsWith(".png") ||
-      url.pathname.endsWith(".webp") ||
-      url.pathname.startsWith("/api/tags") ||
-      url.pathname.startsWith("/api/circles")
+      url.pathname.endsWith(".webp")
     );
 
-    // 3. 构建请求头，剥离高危头并强制复用长连接
+    // 3. 构建安全高效的转发头
     const cleanHeaders = new Headers(request.headers);
-    cleanHeaders.set("Host", PRIMARY_UPSTREAM);
-    cleanHeaders.set("Referer", `https://${PRIMARY_UPSTREAM}/`);
-    cleanHeaders.set("Origin", `https://${PRIMARY_UPSTREAM}`);
     cleanHeaders.set("Connection", "keep-alive");
 
+    // 剥离 Cloudflare 内部标记，防止环路风控
     [
       "cf-connecting-ip",
       "cf-ipcountry",
@@ -48,16 +50,20 @@ export default {
       "x-real-ip"
     ].forEach((h) => cleanHeaders.delete(h));
 
-    // 严格透传 Range 分段请求头以确保音频即点即播
     if (request.headers.has("range")) {
       cleanHeaders.set("range", request.headers.get("range"));
     }
 
+    // 预读取非 GET 请求体
+    const requestBody = (isGet || isHead) ? null : await request.arrayBuffer();
     const candidateHosts = [PRIMARY_UPSTREAM, ...BACKUP_UPSTREAMS];
     let lastError = null;
 
-    // 4. 发起主备节点轮询（带请求超时控制）
+    // 4. 带超时熔断的多节点轮询
     for (const host of candidateHosts) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_LIMIT);
+
       try {
         const targetUrl = new URL(request.url);
         targetUrl.protocol = "https:";
@@ -68,31 +74,32 @@ export default {
         cleanHeaders.set("Referer", `https://${host}/`);
         cleanHeaders.set("Origin", `https://${host}`);
 
-        // 设置边缘请求参数
         const fetchOptions = {
           method: request.method,
           headers: cleanHeaders,
-          body: (isGet || isHead) ? null : request.body,
+          body: requestBody,
           redirect: "follow",
-          cf: isCacheableStatic ? {
+          signal: controller.signal,
+          cf: isCacheable ? {
             cacheEverything: true,
-            cacheTtl: 86400, // 封面与元数据缓存在边缘节点 24 小时
+            cacheTtl: 14400, // 在 Cloudflare 边缘缓存 4 小时，秒开浏览
           } : {
             cacheEverything: false,
           },
         };
 
         const response = await fetch(targetUrl.toString(), fetchOptions);
+        clearTimeout(timeoutId);
 
-        // 如果主站出现 502/503/504 错误，快速切换到备选节点
+        // 如果节点返回 5xx 服务端故障，立即尝试备选源
         if ([502, 503, 504].includes(response.status)) {
-          lastError = new Error(`Upstream ${host} returned ${response.status}`);
+          lastError = new Error(`Node ${host} status ${response.status}`);
           continue;
         }
 
-        // 5. 拼装优化后的响应头
+        // 5. 拼装优化后的客户端响应头
         const responseHeaders = new Headers(response.headers);
-        responseHeaders.set("Access-Control-Allow-Origin": "*");
+        responseHeaders.set("Access-Control-Allow-Origin", "*");
         responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
         responseHeaders.set("Access-Control-Allow-Headers", "*");
         responseHeaders.set(
@@ -104,9 +111,8 @@ export default {
           responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
         }
 
-        // 针对静态封面资源追加浏览器端强缓存
-        if (isCacheableStatic) {
-          responseHeaders.set("Cache-Control", "public, max-age=604800, immutable");
+        if (isCacheable) {
+          responseHeaders.set("Cache-Control", "public, max-age=14400, stale-while-revalidate=3600");
         } else {
           responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
         }
@@ -120,12 +126,14 @@ export default {
           headers: responseHeaders,
         });
       } catch (err) {
+        clearTimeout(timeoutId);
         lastError = err;
+        // 发生超时或连接失败，循环自动进入下一个节点
       }
     }
 
-    return new Response(`All upstream endpoints unreachable: ${lastError?.message}`, {
-      status: 502,
+    return new Response(`All upstream endpoints failed. Last error: ${lastError?.message}`, {
+      status: 504,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
   },
