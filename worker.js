@@ -1,16 +1,16 @@
 const PRIMARY_UPSTREAM = "api.asmr.one";
 const BACKUP_UPSTREAMS = ["api.asmr-200.com", "api.asmr-100.com"];
 
-// 激进竞速阈值：主站 800ms 未响应即自动唤醒备用站并发拉取
+// 阶梯竞速阈值：主站 800ms 未响应即自动唤醒备用站并发拉取
 const RACE_DELAY = 800;
-// 单节点绝对超时
+// 单请求全局硬超时
 const MAX_TIMEOUT = 4000;
 
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "*";
 
-    // 1. CORS 预检极致响应
+    // 1. CORS 跨域预检
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -29,28 +29,32 @@ export default {
     const isHead = request.method === "HEAD";
 
     // 2. 动静路由分流判定
-    const isPublicStatic = (isGet || isHead) && (
-      url.pathname.includes("/api/work/") ||
-      url.pathname.includes("/api/tracks/") ||
-      url.pathname.startsWith("/api/tags") ||
-      url.pathname.startsWith("/api/circles") ||
+    const isWorkOrTrack = url.pathname.includes("/api/work/") || url.pathname.includes("/api/tracks/");
+    const isStaticAsset = (
       url.pathname.includes("/covers/") ||
       url.pathname.endsWith(".jpg") ||
       url.pathname.endsWith(".png") ||
       url.pathname.endsWith(".webp")
     );
+    // 广东移动网络优化：列表与标签走 180 秒微缓存，规避基站频繁重连
+    const isListView = (
+      url.pathname === "/api/works" ||
+      url.pathname.startsWith("/api/tags") ||
+      url.pathname.startsWith("/api/circles")
+    );
 
-    // 3. 边缘 Cache API + 304 快速短路
+    const isCacheable = (isGet || isHead) && (isWorkOrTrack || isStaticAsset || isListView);
+
+    // 3. 边缘 Cache API 与 304 短路协商
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
-    if (isPublicStatic) {
+    if (isCacheable) {
       const cachedResponse = await cache.match(cacheKey);
       if (cachedResponse) {
         const clientEtag = request.headers.get("If-None-Match");
         const cachedEtag = cachedResponse.headers.get("ETag");
 
-        // 命中客户端 304 强缓存，0 字节秒回
         if (clientEtag && cachedEtag && clientEtag === cachedEtag) {
           return new Response(null, {
             status: 304,
@@ -58,7 +62,7 @@ export default {
               "ETag": cachedEtag,
               "Access-Control-Allow-Origin": origin,
               "Access-Control-Allow-Credentials": "true",
-              "Cache-Control": "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600",
+              "Cache-Control": cachedResponse.headers.get("Cache-Control") || "public, max-age=180",
             },
           });
         }
@@ -75,7 +79,7 @@ export default {
       }
     }
 
-    // 4. 请求头清洗与透传准备
+    // 4. 清理请求头
     const cleanHeaders = new Headers(request.headers);
     cleanHeaders.set("Connection", "keep-alive");
 
@@ -120,16 +124,14 @@ export default {
       return res;
     };
 
-    // 6. 阶梯竞速容灾（Happy Eyeballs 机制）
+    // 6. 阶梯竞速机制 (Happy Eyeballs)
     let response;
     const globalAbort = new AbortController();
     const hardTimeout = setTimeout(() => globalAbort.abort(), MAX_TIMEOUT);
 
     try {
-      // 优先调度主节点
       const primaryPromise = fetchFromUpstream(PRIMARY_UPSTREAM, globalAbort.signal);
 
-      // 设置 800ms 计时器，超时则并行触发备选节点竞速
       const delayRace = new Promise((resolve) => setTimeout(resolve, RACE_DELAY)).then(() => {
         return fetchFromUpstream(BACKUP_UPSTREAMS[0], globalAbort.signal);
       });
@@ -139,7 +141,6 @@ export default {
         primaryPromise.catch(() => delayRace),
       ]);
     } catch (err) {
-      // 若竞速均未成功，尝试最后一个冷备节点
       try {
         response = await fetchFromUpstream(BACKUP_UPSTREAMS[1], globalAbort.signal);
       } catch (finalErr) {
@@ -153,7 +154,7 @@ export default {
       clearTimeout(hardTimeout);
     }
 
-    // 7. 组装输出响应头
+    // 7. 组装响应头
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("Access-Control-Allow-Origin", origin);
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
@@ -171,22 +172,24 @@ export default {
     responseHeaders.delete("content-security-policy");
     responseHeaders.delete("content-security-policy-report-only");
 
-    // 8. 响应体动态改写与边缘写入（针对 JSON 自动重写外链）
+    // 8. 响应体改写（将官方域名外链洗白为反代域名）
     const contentType = response.headers.get("content-type") || "";
     let finalBody = response.body;
 
     if (response.status === 200 && contentType.includes("application/json")) {
       let text = await response.text();
-      // 将主站硬编码外链洗白为当前反代域名
       text = text.replaceAll("https://api.asmr.one", `https://${url.host}`);
       text = text.replaceAll("https://www.asmr.one", `https://${url.host}`);
       finalBody = text;
     }
 
-    if (isPublicStatic && response.status === 200) {
+    // 9. 边缘缓存写入
+    if (isCacheable && response.status === 200) {
+      // 详情与静态资源 24 小时，列表 180 秒
+      const maxAge = (isWorkOrTrack || isStaticAsset) ? 86400 : 180;
       responseHeaders.set(
         "Cache-Control",
-        "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600"
+        `public, max-age=${maxAge}, s-maxage=${maxAge}, stale-while-revalidate=60`
       );
       responseHeaders.set("X-Worker-Cache", "MISS");
 
@@ -196,7 +199,6 @@ export default {
         headers: responseHeaders,
       });
 
-      // 异步存入边缘
       ctx.waitUntil(cache.put(cacheKey, responseToCache.clone()));
       return responseToCache;
     } else {
