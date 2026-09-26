@@ -1,7 +1,7 @@
 // worker.js
 const PRIMARY_UPSTREAM = "api.asmr.one";
 const BACKUP_UPSTREAMS = ["api.asmr-200.com", "api.asmr-100.com"];
-const FETCH_TIMEOUT = 9000; // 单个源站请求超时放宽至 9 秒
+const FETCH_TIMEOUT = 9000; // 单源回源硬超时
 
 export default {
   async fetch(request, env, ctx) {
@@ -22,22 +22,36 @@ export default {
     }
 
     const url = new URL(request.url);
+
+    // 2. 边缘安全阻断：仅允许合法业务路由，非业务探测直接 404 丢弃，杜绝回源
+    const isApi = url.pathname.startsWith("/api/");
+    const isCover = url.pathname.startsWith("/covers/");
+    const isStaticMedia = /\.(jpg|jpeg|png|webp|gif|mp3|m4a|flac|wav|lrc|txt|json)$/i.test(url.pathname);
+    const isFavicon = url.pathname === "/favicon.ico";
+
+    if (!isApi && !isCover && !isStaticMedia && !isFavicon) {
+      return new Response("Not Found", {
+        status: 404,
+        headers: { "Content-Type": "text/plain; charset=utf-8" }
+      });
+    }
+
     const isGet = request.method === "GET";
     const isHead = request.method === "HEAD";
     const hasRange = request.headers.has("range");
 
-    // 2. 路由与资源类型判定
+    // 3. 路由类型与缓存资格判定
     const isWorkOrTrack = url.pathname.includes("/api/work/") || url.pathname.includes("/api/tracks/");
-    const isStaticAsset = url.pathname.includes("/covers/") || /\.(jpg|png|webp|mp3|m4a|flac)$/i.test(url.pathname);
+    const isStaticAsset = isCover || isStaticMedia;
     const isListView = url.pathname === "/api/works" || url.pathname.startsWith("/api/tags") || url.pathname.startsWith("/api/circles") || url.pathname.startsWith("/api/vas");
 
-    // 排除带 Range 切片的请求进入缓存
+    // 含有 Range 的音频分片请求严禁写入 Cache API，保障断点续传与拖动进度条
     const isCacheable = (isGet || isHead) && !hasRange && (isWorkOrTrack || isStaticAsset || isListView);
 
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
-    // 3. 边缘缓存检索
+    // 4. 检索边缘缓存
     if (isCacheable) {
       const cachedResponse = await cache.match(cacheKey);
       if (cachedResponse) {
@@ -69,7 +83,7 @@ export default {
       }
     }
 
-    // 4. 清洗与组装上游标头
+    // 5. 标头清洗与上游准备
     const cleanHeaders = new Headers(request.headers);
     [
       "cf-connecting-ip", "cf-ipcountry", "cf-ray", "cf-visitor", 
@@ -78,7 +92,7 @@ export default {
 
     const requestBody = (isGet || isHead) ? null : request.body;
 
-    // 单源请求执行器（带独立超时保护）
+    // 单源请求封装
     async function fetchWithTimeout(host) {
       const targetUrl = new URL(request.url);
       targetUrl.protocol = "https:";
@@ -102,9 +116,9 @@ export default {
           signal: controller.signal
         });
 
-        // 若源站返回服务端故障，主动抛出以触发后续备用源
+        // 遇到服务端故障主动跳过并尝试下一个备用源
         if ([500, 502, 503, 504, 525].includes(res.status)) {
-          throw new Error(`Upstream ${host} returned status: ${res.status}`);
+          throw new Error(`Upstream ${host} returned ${res.status}`);
         }
         return res;
       } finally {
@@ -112,7 +126,7 @@ export default {
       }
     }
 
-    // 5. 串行回退调度策略（防止并发瞬间压垮上游）
+    // 6. 顺序容灾回退（平滑 Failover，避免并发过载）
     let response;
     const upstreams = [PRIMARY_UPSTREAM, ...BACKUP_UPSTREAMS];
     let lastError = null;
@@ -120,10 +134,9 @@ export default {
     for (const host of upstreams) {
       try {
         response = await fetchWithTimeout(host);
-        break; // 请求成功立即跳出，不继续消耗备用源
+        break; // 请求成功立即退出循环
       } catch (err) {
         lastError = err;
-        // 当前源站失败，循环自动尝试下一个备用源
       }
     }
 
@@ -134,7 +147,7 @@ export default {
       });
     }
 
-    // 6. 构造返回标头
+    // 7. 组装返回标头
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set("Access-Control-Allow-Origin", origin);
     responseHeaders.set("Access-Control-Allow-Credentials", "true");
@@ -155,7 +168,7 @@ export default {
     const contentType = response.headers.get("content-type") || "";
     let finalBody = response.body;
 
-    // 仅针对小体积正常 JSON 进行域名重写
+    // 仅在明确为正常 JSON 时改写媒体链接
     if (response.status === 200 && contentType.includes("application/json")) {
       let text = await response.text();
       text = text.replaceAll("https://api.asmr.one", `https://${url.host}`);
@@ -163,7 +176,7 @@ export default {
       finalBody = text;
     }
 
-    // 7. 写入边缘缓存（排除 206 分片及 Range 请求）
+    // 8. 写入边缘缓存（排除 206 分片及 Range 请求）
     if (isCacheable && response.status === 200) {
       const maxAge = isWorkOrTrack || isStaticAsset ? 86400 : 180;
       responseHeaders.set(
