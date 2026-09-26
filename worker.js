@@ -1,6 +1,14 @@
+// 官方上游服务器备选池
+const UPSTREAM_LIST = [
+  "api.asmr-200.com",
+  "api.asmr.one",
+  "api.asmr-100.com",
+  "api.asmr-300.com"
+];
+
 export default {
   async fetch(request, env, ctx) {
-    // 1. 处理浏览器跨域预检请求 (CORS preflight)
+    // 1. 处理 CORS 预检请求
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -13,74 +21,83 @@ export default {
       });
     }
 
-    // 2. 映射目标上游为 asmr.one
-    const upstreamHost = "asmr.one";
-    const targetUrl = new URL(request.url);
-    targetUrl.protocol = "https:";
-    targetUrl.host = upstreamHost;
-    targetUrl.port = "";
+    const clientUrl = new URL(request.url);
+    const requestBody = ["GET", "HEAD"].includes(request.method) ? null : await request.arrayBuffer();
 
-    // 3. 重写与清洗请求头
-    const newHeaders = new Headers(request.headers);
-    newHeaders.set("Host", upstreamHost);
-    newHeaders.set("Referer", `https://${upstreamHost}/`);
-    newHeaders.set("Origin", `https://${upstreamHost}`);
+    let lastError = null;
 
-    // 清洗可能引起上游 CDN 递归检测或拦截的特有请求头
-    const hopHeaders = [
-      "cf-connecting-ip",
-      "cf-ipcountry",
-      "cf-ray",
-      "cf-visitor",
-      "x-forwarded-for",
-      "x-real-ip"
-    ];
-    for (const h of hopHeaders) {
-      newHeaders.delete(h);
-    }
+    // 2. 依次轮询上游节点直至成功
+    for (const upstreamHost of UPSTREAM_LIST) {
+      try {
+        const targetUrl = new URL(request.url);
+        targetUrl.protocol = "https:";
+        targetUrl.host = upstreamHost;
+        targetUrl.port = "";
 
-    // 传递音频分段请求头（保证进度条随意拖动）
-    if (request.headers.has("range")) {
-      newHeaders.set("range", request.headers.get("range"));
-    }
+        const newHeaders = new Headers(request.headers);
+        newHeaders.set("Host", upstreamHost);
+        newHeaders.set("Referer", `https://${upstreamHost}/`);
+        newHeaders.set("Origin", `https://${upstreamHost}`);
 
-    try {
-      // 4. 发送流式请求
-      const response = await fetch(targetUrl.toString(), {
-        method: request.method,
-        headers: newHeaders,
-        body: ["GET", "HEAD"].includes(request.method) ? null : request.body,
-        redirect: "follow",
-      });
+        // 清理 Cloudflare 递归标识，防止循环拦截
+        [
+          "cf-connecting-ip",
+          "cf-ipcountry",
+          "cf-ray",
+          "cf-visitor",
+          "x-forwarded-for",
+          "x-real-ip"
+        ].forEach((header) => newHeaders.delete(header));
 
-      // 5. 组装响应头
-      const responseHeaders = new Headers(response.headers);
-      responseHeaders.set("Access-Control-Allow-Origin", "*");
-      responseHeaders.set("Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-      responseHeaders.set("Access-Control-Allow-Headers", "*");
-      responseHeaders.set(
-        "Access-Control-Expose-Headers",
-        "Content-Length, Content-Range, Accept-Ranges, Content-Type"
-      );
+        // 保持音频分轨 Seek / Range 头
+        if (request.headers.has("range")) {
+          newHeaders.set("range", request.headers.get("range"));
+        }
 
-      if (response.headers.has("accept-ranges")) {
-        responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
+        const response = await fetch(targetUrl.toString(), {
+          method: request.method,
+          headers: newHeaders,
+          body: requestBody,
+          redirect: "follow",
+        });
+
+        // 若当前上游返回 502/503/504，跳过并尝试下一个备选源
+        if ([502, 503, 504].includes(response.status)) {
+          lastError = new Error(`Node ${upstreamHost} returned status ${response.status}`);
+          continue;
+        }
+
+        // 3. 构建成功响应头
+        const responseHeaders = new Headers(response.headers);
+        responseHeaders.set("Access-Control-Allow-Origin": "*");
+        responseHeaders.set("Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+        responseHeaders.set("Access-Control-Allow-Headers": "*");
+        responseHeaders.set(
+          "Access-Control-Expose-Headers",
+          "Content-Length, Content-Range, Accept-Ranges, Content-Type"
+        );
+
+        if (response.headers.has("accept-ranges")) {
+          responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
+        }
+
+        responseHeaders.delete("content-security-policy");
+        responseHeaders.delete("content-security-policy-report-only");
+
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: responseHeaders,
+        });
+      } catch (err) {
+        lastError = err;
       }
-
-      // 移除原有的 CSP 策略，防止本地前端渲染被阻断
-      responseHeaders.delete("content-security-policy");
-      responseHeaders.delete("content-security-policy-report-only");
-
-      return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: responseHeaders,
-      });
-    } catch (err) {
-      return new Response(`Proxy Error: ${err.message}`, {
-        status: 502,
-        headers: { "Content-Type": "text/plain; charset=utf-8" },
-      });
     }
+
+    // 所有节点均无法连通时的降级返回
+    return new Response(`All upstream nodes failed. Last error: ${lastError?.message}`, {
+      status: 502,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
   },
 };
