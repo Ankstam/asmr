@@ -1,13 +1,9 @@
-// 官方上游备选池
-const UPSTREAM_LIST = [
-  "api.asmr-200.com",
-  "api.asmr.one",
-  "api.asmr-100.com",
-  "api.asmr-300.com"
-];
+// 锁定官方主站 API
+const UPSTREAM_HOST = "api.asmr.one";
 
 export default {
   async fetch(request, env, ctx) {
+    // 1. 处理 CORS 跨域
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -20,78 +16,65 @@ export default {
       });
     }
 
-    const requestBody = ["GET", "HEAD"].includes(request.method) ? null : await request.arrayBuffer();
-    let lastError = null;
+    const targetUrl = new URL(request.url);
+    targetUrl.protocol = "https:";
+    targetUrl.host = UPSTREAM_HOST;
+    targetUrl.port = "";
 
-    for (const upstreamHost of UPSTREAM_LIST) {
-      try {
-        const targetUrl = new URL(request.url);
-        targetUrl.protocol = "https:";
-        targetUrl.host = upstreamHost;
-        targetUrl.port = "";
+    // 2. 伪装请求头并清洗 Cloudflare 专有标记
+    const newHeaders = new Headers(request.headers);
+    newHeaders.set("Host", UPSTREAM_HOST);
+    newHeaders.set("Referer", `https://${UPSTREAM_HOST}/`);
+    newHeaders.set("Origin", `https://${UPSTREAM_HOST}`);
 
-        const newHeaders = new Headers(request.headers);
-        newHeaders.set("Host", upstreamHost);
-        newHeaders.set("Referer", `https://${upstreamHost}/`);
-        newHeaders.set("Origin", `https://${upstreamHost}`);
+    [
+      "cf-connecting-ip",
+      "cf-ipcountry",
+      "cf-ray",
+      "cf-visitor",
+      "x-forwarded-for",
+      "x-real-ip"
+    ].forEach((h) => newHeaders.delete(h));
 
-        const hopHeaders = [
-          "cf-connecting-ip",
-          "cf-ipcountry",
-          "cf-ray",
-          "cf-visitor",
-          "x-forwarded-for",
-          "x-real-ip"
-        ];
-        for (const h of hopHeaders) {
-          newHeaders.delete(h);
-        }
-
-        if (request.headers.has("range")) {
-          newHeaders.set("range", request.headers.get("range"));
-        }
-
-        const response = await fetch(targetUrl.toString(), {
-          method: request.method,
-          headers: newHeaders,
-          body: requestBody,
-          redirect: "follow",
-        });
-
-        if ([502, 503, 504].includes(response.status)) {
-          lastError = new Error(`Node ${upstreamHost} returned ${response.status}`);
-          continue;
-        }
-
-        const responseHeaders = new Headers(response.headers);
-        responseHeaders.set("Access-Control-Allow-Origin", "*");
-        responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-        responseHeaders.set("Access-Control-Allow-Headers", "*");
-        responseHeaders.set(
-          "Access-Control-Expose-Headers",
-          "Content-Length, Content-Range, Accept-Ranges, Content-Type"
-        );
-
-        if (response.headers.has("accept-ranges")) {
-          responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
-        }
-
-        responseHeaders.delete("content-security-policy");
-        responseHeaders.delete("content-security-policy-report-only");
-
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders,
-        });
-      } catch (err) {
-        lastError = err;
-      }
+    if (request.headers.has("range")) {
+      newHeaders.set("range", request.headers.get("range"));
     }
 
-    return new Response(`All upstream nodes failed. Last error: ${lastError ? lastError.message : "Unknown"}`, {
-      status: 502,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    try {
+      const response = await fetch(targetUrl.toString(), {
+        method: request.method,
+        headers: newHeaders,
+        body: ["GET", "HEAD"].includes(request.method) ? null : request.body,
+        redirect: "follow",
+      });
+
+      // 3. 构造完整响应头，保留音频流支持
+      const responseHeaders = new Headers(response.headers);
+      responseHeaders.set("Access-Control-Allow-Origin", "*");
+      responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+      responseHeaders.set("Access-Control-Allow-Headers", "*");
+      responseHeaders.set(
+        "Access-Control-Expose-Headers",
+        "Content-Length, Content-Range, Accept-Ranges, Content-Type"
+      );
+
+      if (response.headers.has("accept-ranges")) {
+        responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
+      }
+
+      responseHeaders.delete("content-security-policy");
+      responseHeaders.delete("content-security-policy-report-only");
+
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    } catch (err) {
+      return new Response(`Proxy Error: ${err.message}`, {
+        status: 502,
+        headers: { "Content-Type": "text/plain; charset=utf-8" },
+      });
+    }
   },
 };
