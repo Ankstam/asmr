@@ -1,14 +1,16 @@
 const PRIMARY_UPSTREAM = "api.asmr.one";
 const BACKUP_UPSTREAMS = ["api.asmr-200.com", "api.asmr-100.com"];
 
-// 单节点超时熔断时间（毫秒）
-const TIMEOUT_LIMIT = 3500;
+// 激进竞速阈值：主站 800ms 未响应即自动唤醒备用站并发拉取
+const RACE_DELAY = 800;
+// 单节点绝对超时
+const MAX_TIMEOUT = 4000;
 
 export default {
   async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "*";
 
-    // 1. CORS 预检处理（对齐官方镜像规范）
+    // 1. CORS 预检极致响应
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -26,7 +28,7 @@ export default {
     const isGet = request.method === "GET";
     const isHead = request.method === "HEAD";
 
-    // 2. 判定可安全边缘缓存的公开元数据
+    // 2. 动静路由分流判定
     const isPublicStatic = (isGet || isHead) && (
       url.pathname.includes("/api/work/") ||
       url.pathname.includes("/api/tracks/") ||
@@ -38,13 +40,29 @@ export default {
       url.pathname.endsWith(".webp")
     );
 
-    // 3. 利用 Cloudflare Cache API 绕过 Authorization 穿透
+    // 3. 边缘 Cache API + 304 快速短路
     const cache = caches.default;
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
     if (isPublicStatic) {
       const cachedResponse = await cache.match(cacheKey);
       if (cachedResponse) {
+        const clientEtag = request.headers.get("If-None-Match");
+        const cachedEtag = cachedResponse.headers.get("ETag");
+
+        // 命中客户端 304 强缓存，0 字节秒回
+        if (clientEtag && cachedEtag && clientEtag === cachedEtag) {
+          return new Response(null, {
+            status: 304,
+            headers: {
+              "ETag": cachedEtag,
+              "Access-Control-Allow-Origin": origin,
+              "Access-Control-Allow-Credentials": "true",
+              "Cache-Control": "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600",
+            },
+          });
+        }
+
         const hitHeaders = new Headers(cachedResponse.headers);
         hitHeaders.set("X-Worker-Cache", "HIT");
         hitHeaders.set("Access-Control-Allow-Origin", origin);
@@ -57,7 +75,7 @@ export default {
       }
     }
 
-    // 4. 构建转发头
+    // 4. 请求头清洗与透传准备
     const cleanHeaders = new Headers(request.headers);
     cleanHeaders.set("Connection", "keep-alive");
 
@@ -75,88 +93,119 @@ export default {
     }
 
     const requestBody = (isGet || isHead) ? null : await request.arrayBuffer();
-    const candidateHosts = [PRIMARY_UPSTREAM, ...BACKUP_UPSTREAMS];
-    let lastError = null;
 
-    // 5. 故障切换轮询
-    for (const host of candidateHosts) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_LIMIT);
+    // 5. 单节点请求封装
+    const fetchFromUpstream = async (host, signal) => {
+      const targetUrl = new URL(request.url);
+      targetUrl.protocol = "https:";
+      targetUrl.host = host;
+      targetUrl.port = "";
 
-      try {
-        const targetUrl = new URL(request.url);
-        targetUrl.protocol = "https:";
-        targetUrl.host = host;
-        targetUrl.port = "";
+      const headers = new Headers(cleanHeaders);
+      headers.set("Host", host);
+      headers.set("Referer", `https://${host}/`);
+      headers.set("Origin", `https://${host}`);
 
-        cleanHeaders.set("Host", host);
-        cleanHeaders.set("Referer", `https://${host}/`);
-        cleanHeaders.set("Origin", `https://${host}`);
+      const res = await fetch(targetUrl.toString(), {
+        method: request.method,
+        headers: headers,
+        body: requestBody,
+        redirect: "follow",
+        signal: signal,
+      });
 
-        const fetchOptions = {
-          method: request.method,
-          headers: cleanHeaders,
-          body: requestBody,
-          redirect: "follow",
-          signal: controller.signal,
-        };
-
-        const response = await fetch(targetUrl.toString(), fetchOptions);
-        clearTimeout(timeoutId);
-
-        if ([502, 503, 504].includes(response.status)) {
-          lastError = new Error(`Host ${host} returned ${response.status}`);
-          continue;
-        }
-
-        // 6. 构造响应头
-        const responseHeaders = new Headers(response.headers);
-        responseHeaders.set("Access-Control-Allow-Origin", origin);
-        responseHeaders.set("Access-Control-Allow-Credentials", "true");
-        responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-        responseHeaders.set("Access-Control-Allow-Headers", "*");
-        responseHeaders.set(
-          "Access-Control-Expose-Headers",
-          "Content-Length, Content-Range, Accept-Ranges, Content-Type"
-        );
-
-        if (response.headers.has("accept-ranges")) {
-          responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
-        }
-
-        responseHeaders.delete("content-security-policy");
-        responseHeaders.delete("content-security-policy-report-only");
-
-        // 7. 写入边缘缓存
-        if (isPublicStatic && response.status === 200) {
-          responseHeaders.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
-          responseHeaders.set("X-Worker-Cache", "MISS");
-
-          const responseToCache = new Response(response.clone().body, {
-            status: response.status,
-            statusText: response.statusText,
-            headers: responseHeaders,
-          });
-
-          ctx.waitUntil(cache.put(cacheKey, responseToCache));
-        } else {
-          responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
-        }
-
-        return new Response(response.body, {
-          status: response.status,
-          statusText: response.statusText,
-          headers: responseHeaders,
-        });
-      } catch (err) {
-        clearTimeout(timeoutId);
-        lastError = err;
+      if ([502, 503, 504].includes(res.status)) {
+        throw new Error(`Upstream ${host} status: ${res.status}`);
       }
+      return res;
+    };
+
+    // 6. 阶梯竞速容灾（Happy Eyeballs 机制）
+    let response;
+    const globalAbort = new AbortController();
+    const hardTimeout = setTimeout(() => globalAbort.abort(), MAX_TIMEOUT);
+
+    try {
+      // 优先调度主节点
+      const primaryPromise = fetchFromUpstream(PRIMARY_UPSTREAM, globalAbort.signal);
+
+      // 设置 800ms 计时器，超时则并行触发备选节点竞速
+      const delayRace = new Promise((resolve) => setTimeout(resolve, RACE_DELAY)).then(() => {
+        return fetchFromUpstream(BACKUP_UPSTREAMS[0], globalAbort.signal);
+      });
+
+      response = await Promise.race([
+        primaryPromise,
+        primaryPromise.catch(() => delayRace),
+      ]);
+    } catch (err) {
+      // 若竞速均未成功，尝试最后一个冷备节点
+      try {
+        response = await fetchFromUpstream(BACKUP_UPSTREAMS[1], globalAbort.signal);
+      } catch (finalErr) {
+        clearTimeout(hardTimeout);
+        return new Response(`All upstream endpoints failed: ${finalErr.message}`, {
+          status: 504,
+          headers: { "Content-Type": "text/plain; charset=utf-8" },
+        });
+      }
+    } finally {
+      clearTimeout(hardTimeout);
     }
 
-    return new Response(`All upstream endpoints unreachable: ${lastError?.message}`, {
-      status: 504,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    });
+    // 7. 组装输出响应头
+    const responseHeaders = new Headers(response.headers);
+    responseHeaders.set("Access-Control-Allow-Origin", origin);
+    responseHeaders.set("Access-Control-Allow-Credentials", "true");
+    responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+    responseHeaders.set("Access-Control-Allow-Headers", "*");
+    responseHeaders.set(
+      "Access-Control-Expose-Headers",
+      "Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag"
+    );
+
+    if (response.headers.has("accept-ranges")) {
+      responseHeaders.set("Accept-Ranges", response.headers.get("accept-ranges"));
+    }
+
+    responseHeaders.delete("content-security-policy");
+    responseHeaders.delete("content-security-policy-report-only");
+
+    // 8. 响应体动态改写与边缘写入（针对 JSON 自动重写外链）
+    const contentType = response.headers.get("content-type") || "";
+    let finalBody = response.body;
+
+    if (response.status === 200 && contentType.includes("application/json")) {
+      let text = await response.text();
+      // 将主站硬编码外链洗白为当前反代域名
+      text = text.replaceAll("https://api.asmr.one", `https://${url.host}`);
+      text = text.replaceAll("https://www.asmr.one", `https://${url.host}`);
+      finalBody = text;
+    }
+
+    if (isPublicStatic && response.status === 200) {
+      responseHeaders.set(
+        "Cache-Control",
+        "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600"
+      );
+      responseHeaders.set("X-Worker-Cache", "MISS");
+
+      const responseToCache = new Response(finalBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+
+      // 异步存入边缘
+      ctx.waitUntil(cache.put(cacheKey, responseToCache.clone()));
+      return responseToCache;
+    } else {
+      responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+      return new Response(finalBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    }
   },
 };
