@@ -26,8 +26,7 @@ export default {
     const isGet = request.method === "GET";
     const isHead = request.method === "HEAD";
 
-    // 2. 严格判定公开元数据（可安全共享缓存）
-    // 严禁缓存用户私有数据接口（如 /api/auth/me、/api/review）
+    // 2. 判定可安全边缘缓存的公开元数据
     const isPublicStatic = (isGet || isHead) && (
       url.pathname.includes("/api/work/") ||
       url.pathname.includes("/api/tracks/") ||
@@ -39,9 +38,8 @@ export default {
       url.pathname.endsWith(".webp")
     );
 
-    // 3. 利用 Cloudflare Cache API 绕过 Authorization 缓存穿透限制
+    // 3. 利用 Cloudflare Cache API 绕过 Authorization 穿透
     const cache = caches.default;
-    // 纯 URL 构筑缓存 Key，忽略请求头中的 Bearer Token
     const cacheKey = new Request(url.toString(), { method: "GET" });
 
     if (isPublicStatic) {
@@ -49,7 +47,7 @@ export default {
       if (cachedResponse) {
         const hitHeaders = new Headers(cachedResponse.headers);
         hitHeaders.set("X-Worker-Cache", "HIT");
-        hitHeaders.set("Access-Control-Allow-Origin": origin);
+        hitHeaders.set("Access-Control-Allow-Origin", origin);
         hitHeaders.set("Access-Control-Allow-Credentials", "true");
         return new Response(cachedResponse.body, {
           status: cachedResponse.status,
@@ -59,11 +57,10 @@ export default {
       }
     }
 
-    // 4. 构建干净的转发头
+    // 4. 构建转发头
     const cleanHeaders = new Headers(request.headers);
     cleanHeaders.set("Connection", "keep-alive");
 
-    // 剥离 CDN 级联风险请求头
     [
       "cf-connecting-ip",
       "cf-ipcountry",
@@ -81,7 +78,7 @@ export default {
     const candidateHosts = [PRIMARY_UPSTREAM, ...BACKUP_UPSTREAMS];
     let lastError = null;
 
-    // 5. 快速故障切换转发
+    // 5. 故障切换轮询
     for (const host of candidateHosts) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_LIMIT);
@@ -107,13 +104,12 @@ export default {
         const response = await fetch(targetUrl.toString(), fetchOptions);
         clearTimeout(timeoutId);
 
-        // 上游服务故障快速换源
         if ([502, 503, 504].includes(response.status)) {
           lastError = new Error(`Host ${host} returned ${response.status}`);
           continue;
         }
 
-        // 6. 构造输出响应头
+        // 6. 构造响应头
         const responseHeaders = new Headers(response.headers);
         responseHeaders.set("Access-Control-Allow-Origin", origin);
         responseHeaders.set("Access-Control-Allow-Credentials", "true");
@@ -131,7 +127,7 @@ export default {
         responseHeaders.delete("content-security-policy");
         responseHeaders.delete("content-security-policy-report-only");
 
-        // 7. 将成功的公开元数据写入边缘 Cache API
+        // 7. 写入边缘缓存
         if (isPublicStatic && response.status === 200) {
           responseHeaders.set("Cache-Control", "public, max-age=86400, s-maxage=86400");
           responseHeaders.set("X-Worker-Cache", "MISS");
@@ -142,7 +138,6 @@ export default {
             headers: responseHeaders,
           });
 
-          // 异步写入缓存，不阻塞客户端返回
           ctx.waitUntil(cache.put(cacheKey, responseToCache));
         } else {
           responseHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
