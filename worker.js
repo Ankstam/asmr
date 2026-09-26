@@ -67,11 +67,11 @@ export default {
           continue;
         }
 
-        // 3. 构建成功响应头
+        // 3. 构建成功响应头（已在此处修正为正确的逗号分隔）
         const responseHeaders = new Headers(response.headers);
-        responseHeaders.set("Access-Control-Allow-Origin": "*");
-        responseHeaders.set("Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS");
-        responseHeaders.set("Access-Control-Allow-Headers": "*");
+        responseHeaders.set("Access-Control-Allow-Origin", "*");
+        responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS");
+        responseHeaders.set("Access-Control-Allow-Headers", "*");
         responseHeaders.set(
           "Access-Control-Expose-Headers",
           "Content-Length, Content-Range, Accept-Ranges, Content-Type"
